@@ -12,6 +12,7 @@ ratatui = "0.29"
 crossterm = "0.27"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls"] }
 
 [[bin]]
 name = "client"
