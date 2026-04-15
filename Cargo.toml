@@ -1,0 +1,12 @@
+[package]
+name = "ratroom-async"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+serde_json = "1.0"
+ratatui = "0.29"
+crossterm = "0.27"
