@@ -3,21 +3,27 @@ mod shared;
 
 use shared::protocol::*;
 
+use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
+use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::{Row, SqlitePool};
+use std::str::FromStr;
 use tracing::{error, info, warn};
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{fmt, EnvFilter};
 
 use std::collections::HashMap;
 use std::sync::{
-    Arc,
     atomic::{AtomicUsize, Ordering},
+    Arc,
 };
 
 use serde::Deserialize;
-use serde_json;
 use std::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{mpsc, Mutex};
 
 #[derive(Clone)]
 struct Client {
@@ -27,7 +33,6 @@ struct Client {
 }
 
 type Clients = Arc<Mutex<HashMap<usize, Client>>>;
-type Users = Arc<Mutex<HashMap<String, String>>>;
 static NEXT_CLIENT_ID: AtomicUsize = AtomicUsize::new(1);
 const DEFAULT_ROOM: &str = "lobby";
 
@@ -35,23 +40,6 @@ const DEFAULT_ROOM: &str = "lobby";
 struct Config {
     host: String,
     port: u16,
-}
-
-fn init_logging() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-
-    fmt().with_env_filter(filter).init();
-}
-
-fn load_config() -> Config {
-    info!("loading server config from server.toml");
-    let contents = fs::read_to_string("server.toml").expect("Failed to read server.toml");
-
-    let config: Config = toml::from_str(&contents).expect("Invalid server.toml format");
-
-    info!("server config loaded: {}:{}", config.host, config.port);
-
-    config
 }
 
 #[tokio::main]
@@ -70,17 +58,36 @@ async fn main() {
     info!("listening on {}", address);
 
     let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
-    let users: Users = Arc::new(Mutex::new(HashMap::new()));
+
+    let options = SqliteConnectOptions::from_str("sqlite://chat.db")
+        .expect("Invalid SQLite connection string")
+        .create_if_missing(true);
+
+    let db = SqlitePool::connect_with(options)
+        .await
+        .expect("Failed to connect to SQLite");
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            password TEXT NOT NULL
+        )",
+    )
+        .execute(&db)
+        .await
+        .expect("Failed to create users table");
+
+    info!("database connected and users table ready");
 
     loop {
         let (socket, addr) = listener.accept().await.expect("Failed to accept");
         info!("new client connected: {}", addr);
 
         let clients = Arc::clone(&clients);
-        let users = Arc::clone(&users);
+        let db = db.clone();
 
         tokio::spawn(async move {
-            handle_client(socket, clients, users).await;
+            handle_client(socket, clients, db).await;
         });
     }
 }
@@ -89,7 +96,7 @@ async fn send_json(
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     message: &ServerMessage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let json = serde_json::to_string(&message)?;
+    let json = serde_json::to_string(message)?;
 
     writer.write_all(json.as_bytes()).await?;
     writer.write_all(b"\n").await?;
@@ -137,9 +144,7 @@ async fn broadcast_chat_to_room(clients: &Clients, username: &str, room: &str, m
 
 async fn get_client_room(clients: &Clients, client_id: usize) -> Option<String> {
     let clients_guard = clients.lock().await;
-    clients_guard
-        .get(&client_id)
-        .map(|client| client.room.clone())
+    clients_guard.get(&client_id).map(|client| client.room.clone())
 }
 
 async fn move_client_to_room(
@@ -167,7 +172,7 @@ async fn list_rooms(clients: &Clients) -> Vec<String> {
     rooms
 }
 
-async fn handle_client(socket: TcpStream, clients: Clients, users: Users) {
+async fn handle_client(socket: TcpStream, clients: Clients, db: SqlitePool) {
     let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     info!("starting session for client_id={}", client_id);
 
@@ -201,7 +206,7 @@ async fn handle_client(socket: TcpStream, clients: Clients, users: Users) {
                     message: "Invalid protocol message".to_string(),
                 },
             )
-            .await;
+                .await;
 
             return;
         }
@@ -243,29 +248,57 @@ async fn handle_client(socket: TcpStream, clients: Clients, users: Users) {
                 return;
             }
 
-            let mut users_guard = users.lock().await;
+            let salt = SaltString::generate(&mut OsRng);
+            let argon2 = Argon2::default();
 
-            if users_guard.contains_key(&username) {
-                warn!(
-                    "client_id={} attempted duplicate registration for '{}'",
-                    client_id, username
-                );
+            let password_hash = match argon2.hash_password(password.as_bytes(), &salt) {
+                Ok(hash) => hash.to_string(),
+                Err(e) => {
+                    error!(
+                        "client_id={} failed to hash password for '{}': {}",
+                        client_id, username, e
+                    );
 
-                let _ = send_json(
-                    &mut writer,
-                    &ServerMessage::AuthError {
-                        message: "Username already exists".to_string(),
-                    },
-                )
-                    .await;
+                    let _ = send_json(
+                        &mut writer,
+                        &ServerMessage::AuthError {
+                            message: "Failed to create account".to_string(),
+                        },
+                    )
+                        .await;
 
-                return;
+                    return;
+                }
+            };
+
+            let result = sqlx::query("INSERT INTO users (username, password) VALUES (?, ?)")
+                .bind(&username)
+                .bind(&password_hash)
+                .execute(&db)
+                .await;
+
+            match result {
+                Ok(_) => {
+                    info!("client_id={} registered username='{}' in DB", client_id, username);
+                    username
+                }
+                Err(e) => {
+                    warn!(
+                        "client_id={} failed registration for '{}': {}",
+                        client_id, username, e
+                    );
+
+                    let _ = send_json(
+                        &mut writer,
+                        &ServerMessage::AuthError {
+                            message: "Username already exists".to_string(),
+                        },
+                    )
+                        .await;
+
+                    return;
+                }
             }
-
-            users_guard.insert(username.clone(), password);
-
-            info!("client_id={} registered username='{}'", client_id, username);
-            username
         }
 
         ClientMessage::Login { username, password } => {
@@ -289,15 +322,58 @@ async fn handle_client(socket: TcpStream, clients: Clients, users: Users) {
                 return;
             }
 
-            let users_guard = users.lock().await;
+            let row = sqlx::query("SELECT password FROM users WHERE username = ?")
+                .bind(&username)
+                .fetch_optional(&db)
+                .await
+                .expect("DB query failed");
 
-            match users_guard.get(&username) {
-                Some(stored_password) if stored_password == &password => {
+            match row {
+                Some(row) => {
+                    let stored_password: String = row.get("password");
+
+                    let parsed_hash = match PasswordHash::new(&stored_password) {
+                        Ok(hash) => hash,
+                        Err(e) => {
+                            error!(
+                                "stored password hash for '{}' is invalid: {}",
+                                username, e
+                            );
+
+                            let _ = send_json(
+                                &mut writer,
+                                &ServerMessage::AuthError {
+                                    message: "Invalid username or password".to_string(),
+                                },
+                            )
+                                .await;
+
+                            return;
+                        }
+                    };
+
+                    if Argon2::default()
+                        .verify_password(password.as_bytes(), &parsed_hash)
+                        .is_err()
+                    {
+                        warn!("client_id={} failed login for '{}'", client_id, username);
+
+                        let _ = send_json(
+                            &mut writer,
+                            &ServerMessage::AuthError {
+                                message: "Invalid username or password".to_string(),
+                            },
+                        )
+                            .await;
+
+                        return;
+                    }
+
                     info!("client_id={} logged in as '{}'", client_id, username);
                     username
                 }
-                _ => {
-                    warn!("client_id={} failed login for '{}'", client_id, username);
+                None => {
+                    warn!("client_id={} failed login for unknown user '{}'", client_id, username);
 
                     let _ = send_json(
                         &mut writer,
@@ -327,8 +403,6 @@ async fn handle_client(socket: TcpStream, clients: Clients, users: Users) {
         }
     };
 
-    let _ = send_json(&mut writer, &ServerMessage::AuthOk).await;
-
     if username_exists(&clients, &username).await {
         warn!(
             "client_id={} tried to connect with username '{}' already active",
@@ -345,6 +419,8 @@ async fn handle_client(socket: TcpStream, clients: Clients, users: Users) {
 
         return;
     }
+
+    let _ = send_json(&mut writer, &ServerMessage::AuthOk).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
 
@@ -366,7 +442,7 @@ async fn handle_client(socket: TcpStream, clients: Clients, users: Users) {
             message: format!("Welcome {}", username),
         },
     )
-    .await;
+        .await;
 
     let _ = send_json(
         &mut writer,
@@ -374,10 +450,10 @@ async fn handle_client(socket: TcpStream, clients: Clients, users: Users) {
             room: DEFAULT_ROOM.to_string(),
         },
     )
-    .await;
+        .await;
 
     info!(
-        "client_id={} registered username='{}' room='{}'",
+        "client_id={} authenticated username='{}' room='{}'",
         client_id, username, DEFAULT_ROOM
     );
 
@@ -409,6 +485,7 @@ async fn handle_client(socket: TcpStream, clients: Clients, users: Users) {
                 break;
             }
         }
+
         info!("writer task ended for username='{}'", username_for_writer);
     });
 
@@ -417,14 +494,14 @@ async fn handle_client(socket: TcpStream, clients: Clients, users: Users) {
         DEFAULT_ROOM,
         &format!("{username} joined {DEFAULT_ROOM}"),
     )
-    .await;
+        .await;
     info!("username='{}' joined room='{}'", username, DEFAULT_ROOM);
 
     while let Ok(Some(line)) = lines.next_line().await {
         let parsed: ClientMessage = match serde_json::from_str(&line) {
             Ok(msg) => msg,
             Err(e) => {
-                warn!("invalid JSON received from username='{}: {}'", username, e);
+                warn!("invalid JSON received from username='{}': {}", username, e);
                 continue;
             }
         };
@@ -446,10 +523,7 @@ async fn handle_client(socket: TcpStream, clients: Clients, users: Users) {
                 }
             }
             ClientMessage::Register { .. } | ClientMessage::Login { .. } => {
-                warn!(
-                    "username='{}' tried to authenticate mid-session",
-                    username
-                );
+                warn!("username='{}' tried to authenticate mid-session", username);
             }
             ClientMessage::JoinRoom { room } => {
                 let room = room.trim();
@@ -475,15 +549,16 @@ async fn handle_client(socket: TcpStream, clients: Clients, users: Users) {
                             &old_room,
                             &format!("{username} left {old_room}"),
                         )
-                        .await;
+                            .await;
 
                         broadcast_system_to_room(
                             &clients,
                             room,
                             &format!("{username} joined {room}"),
                         )
-                        .await;
+                            .await;
                     }
+
                     info!(
                         "username='{}' moved from room='{}' to room='{}'",
                         username, old_room, room
@@ -502,7 +577,6 @@ async fn handle_client(socket: TcpStream, clients: Clients, users: Users) {
                         .map(|client| client.tx.send(ServerMessage::RoomList { rooms }))
                 };
             }
-
             ClientMessage::LeaveRoom => {
                 let moved = move_client_to_room(&clients, client_id, DEFAULT_ROOM).await;
 
@@ -522,14 +596,14 @@ async fn handle_client(socket: TcpStream, clients: Clients, users: Users) {
                             &old_room,
                             &format!("{username} left {old_room}"),
                         )
-                        .await;
+                            .await;
 
                         broadcast_system_to_room(
                             &clients,
                             DEFAULT_ROOM,
                             &format!("{username} joined {DEFAULT_ROOM}"),
                         )
-                        .await;
+                            .await;
                     }
 
                     info!(
@@ -555,10 +629,27 @@ async fn handle_client(socket: TcpStream, clients: Clients, users: Users) {
         &current_room,
         &format!("{username} left {current_room}"),
     )
-    .await;
+        .await;
 
     info!(
         "username='{}' disconnected from room='{}'",
         username, current_room
     );
+}
+
+fn init_logging() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    fmt().with_env_filter(filter).init();
+}
+
+fn load_config() -> Config {
+    info!("loading server config from server.toml");
+    let contents = fs::read_to_string("server.toml").expect("Failed to read server.toml");
+
+    let config: Config = toml::from_str(&contents).expect("Invalid server.toml format");
+
+    info!("server config loaded: {}:{}", config.host, config.port);
+
+    config
 }
