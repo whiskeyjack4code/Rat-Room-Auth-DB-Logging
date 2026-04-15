@@ -1,28 +1,34 @@
-#[path = "../protocol.rs"]
-mod protocol;
+mod client;
+mod shared;
 
-use protocol::{ClientMessage, ServerMessage};
+use shared::protocol::*;
+
 use serde::Deserialize;
 use std::fs;
 
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     widgets::{Block, Borders, Paragraph},
-    Terminal,
 };
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{tcp::OwnedWriteHalf, TcpStream};
+use tokio::net::{TcpStream, tcp::OwnedWriteHalf};
 use tokio::sync::mpsc;
 
 const MAX_MESSAGES: usize = 200;
+
+enum AuthMode {
+    Register,
+    Login,
+}
 
 struct App {
     messages: Vec<String>,
@@ -39,11 +45,9 @@ struct Config {
 }
 
 fn load_config() -> Config {
-    let contents = fs::read_to_string("client.toml")
-        .expect("Failed to read client.toml");
+    let contents = fs::read_to_string("client.toml").expect("Failed to read client.toml");
 
-    toml::from_str(&contents)
-        .expect("Invalid client.toml format")
+    toml::from_str(&contents).expect("Invalid client.toml format")
 }
 
 impl App {
@@ -111,7 +115,7 @@ async fn handle_input(app: &mut App, writer: &mut OwnedWriteHalf) {
                     room: room.to_string(),
                 },
             )
-                .await;
+            .await;
         }
     } else {
         send_json(
@@ -120,7 +124,7 @@ async fn handle_input(app: &mut App, writer: &mut OwnedWriteHalf) {
                 message: message.clone(),
             },
         )
-            .await;
+        .await;
     }
 
     app.input.clear();
@@ -130,9 +134,9 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &App) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(1),     // chat
-            Constraint::Length(3),  // input
-            Constraint::Length(2),  // status/help
+            Constraint::Min(1),    // chat
+            Constraint::Length(3), // input
+            Constraint::Length(2), // status/help
         ])
         .split(frame.area());
 
@@ -173,12 +177,29 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &App) {
 #[tokio::main]
 async fn main() {
     let mut stdin = BufReader::new(tokio::io::stdin());
-    let mut username = String::new();
 
+    let mut mode_input = String::new();
+    println!("Type 'register' or 'login':");
+    stdin.read_line(&mut mode_input).await.unwrap();
+
+    let auth_mode = match mode_input.trim().to_lowercase().as_str() {
+        "register" => AuthMode::Register,
+        "login" => AuthMode::Login,
+        _ => {
+            println!("Invalid option. Please start again and type 'register' or 'login'.");
+            return;
+        }
+    };
+
+    let mut username = String::new();
     println!("Enter username:");
     stdin.read_line(&mut username).await.unwrap();
-
     let username = username.trim().to_string();
+
+    let mut password = String::new();
+    println!("Enter password:");
+    stdin.read_line(&mut password).await.unwrap();
+    let password = password.trim().to_string();
 
     let config = load_config();
     let address = format!("{}:{}", config.host, config.port);
@@ -191,18 +212,60 @@ async fn main() {
 
     let (reader, mut writer) = stream.into_split();
 
-    send_json(
-        &mut writer,
-        &ClientMessage::SetUsername {
+    let auth_message = match auth_mode {
+        AuthMode::Register => ClientMessage::Register {
             username: username.clone(),
+            password,
         },
-    )
-        .await;
+        AuthMode::Login => ClientMessage::Login {
+            username: username.clone(),
+            password,
+        },
+    };
+
+    send_json(&mut writer, &auth_message).await;
+
+    let mut reader = BufReader::new(reader);
+    let mut first_response = String::new();
+
+    match reader.read_line(&mut first_response).await {
+        Ok(0) => {
+            println!("Server closed the connection during authentication.");
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            println!("Failed to read authentication response: {e}");
+            return;
+        }
+    }
+
+    let auth_response: ServerMessage = match serde_json::from_str(first_response.trim()) {
+        Ok(msg) => msg,
+        Err(e) => {
+            println!("Failed to parse authentication response: {e}");
+            return;
+        }
+    };
+
+    match auth_response {
+        ServerMessage::AuthOk => {
+            println!("Authentication successful.");
+        }
+        ServerMessage::AuthError { message } => {
+            println!("Authentication failed: {message}");
+            return;
+        }
+        other => {
+            println!("Unexpected server response during authentication: {:?}", other);
+            return;
+        }
+    }
 
     let (tx, mut rx) = mpsc::unbounded_channel();
 
+    println!("Connected and authenticated as {}", username);
     tokio::spawn(async move {
-        let mut reader = BufReader::new(reader);
         let mut line = String::new();
 
         loop {
@@ -232,6 +295,12 @@ async fn main() {
     loop {
         while let Ok(msg) = rx.try_recv() {
             match msg {
+                ServerMessage::AuthOk => {
+                    app.push_message("[auth] Authentication successful".to_string());
+                }
+                ServerMessage::AuthError { message } => {
+                    app.push_message(format!("[auth error] {message}"));
+                }
                 ServerMessage::Welcome { message } => {
                     app.push_message(format!("[welcome] {message}"));
                 }

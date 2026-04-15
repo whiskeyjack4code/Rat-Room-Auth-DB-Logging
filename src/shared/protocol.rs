@@ -3,8 +3,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
-    #[serde(rename = "set_username")]
-    SetUsername { username: String },
+    #[serde(rename = "register")]
+    Register { username: String, password: String },
+
+    #[serde(rename = "login")]
+    Login { username: String, password: String },
 
     #[serde(rename = "chat")]
     Chat { message: String },
@@ -22,6 +25,12 @@ pub enum ClientMessage {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
+    #[serde(rename = "auth_ok")]
+    AuthOk,
+
+    #[serde(rename = "auth_error")]
+    AuthError { message: String },
+
     #[serde(rename = "welcome")]
     Welcome { message: String },
 
@@ -32,7 +41,11 @@ pub enum ServerMessage {
     System { message: String },
 
     #[serde(rename = "chat")]
-    Chat { username: String, room: String, message: String },
+    Chat {
+        username: String,
+        room: String,
+        message: String,
+    },
 
     #[serde(rename = "room_joined")]
     RoomJoined { room: String },
