@@ -145,8 +145,8 @@ SQLite database (`chat.db`) is created automatically.
 ## Screenshot
 
 ![Chat Screenshot](ratroom-db-1.png)
-![Chat Screenshot](ratroom-db-1.png)
-![Chat Screenshot](ratroom-db-1.png)
+![Chat Screenshot](ratroom-db-2.png)
+![Chat Screenshot](ratroom-db-3.png)
 
 ---
 
