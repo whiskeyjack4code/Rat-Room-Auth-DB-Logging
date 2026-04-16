@@ -1,6 +1,10 @@
 mod client;
 mod shared;
 
+use client::app::App;
+use client::commands::handle_input;
+use client::network::send_json;
+use client::ui::draw_ui;
 use shared::protocol::*;
 
 use serde::Deserialize;
@@ -12,30 +16,14 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 
-use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    widgets::{Block, Borders, Paragraph},
-};
-
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpStream, tcp::OwnedWriteHalf};
+use ratatui::{Terminal, backend::CrosstermBackend};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-
-const MAX_MESSAGES: usize = 200;
 
 enum AuthMode {
     Register,
     Login,
-}
-
-struct App {
-    messages: Vec<String>,
-    input: String,
-    username: String,
-    room: String,
-    scroll: usize,
 }
 
 #[derive(Deserialize)]
@@ -48,130 +36,6 @@ fn load_config() -> Config {
     let contents = fs::read_to_string("client.toml").expect("Failed to read client.toml");
 
     toml::from_str(&contents).expect("Invalid client.toml format")
-}
-
-impl App {
-    fn new(username: String) -> Self {
-        Self {
-            messages: Vec::new(),
-            input: String::new(),
-            username,
-            room: "lobby".to_string(),
-            scroll: 0,
-        }
-    }
-
-    fn push_message(&mut self, message: String) {
-        self.messages.push(message);
-
-        if self.messages.len() > MAX_MESSAGES {
-            let overflow = self.messages.len() - MAX_MESSAGES;
-            self.messages.drain(0..overflow);
-        }
-
-        self.scroll_to_bottom();
-    }
-
-    fn scroll_up(&mut self) {
-        if self.scroll > 0 {
-            self.scroll -= 1;
-        }
-    }
-
-    fn scroll_down(&mut self) {
-        self.scroll += 1;
-    }
-
-    fn scroll_to_bottom(&mut self) {
-        self.scroll = self.messages.len();
-    }
-}
-
-async fn send_json(writer: &mut OwnedWriteHalf, message: &ClientMessage) {
-    if let Ok(json) = serde_json::to_string(message) {
-        let _ = writer.write_all(json.as_bytes()).await;
-        let _ = writer.write_all(b"\n").await;
-    }
-}
-
-async fn handle_input(app: &mut App, writer: &mut OwnedWriteHalf) {
-    let message = app.input.trim().to_string();
-
-    if message.is_empty() {
-        return;
-    }
-
-    if message == "/leave" {
-        send_json(writer, &ClientMessage::LeaveRoom).await;
-    } else if message == "/rooms" {
-        send_json(writer, &ClientMessage::ListRooms).await;
-    } else if let Some(room) = message.strip_prefix("/join ") {
-        let room = room.trim();
-
-        if !room.is_empty() {
-            send_json(
-                writer,
-                &ClientMessage::JoinRoom {
-                    room: room.to_string(),
-                },
-            )
-            .await;
-        }
-    } else {
-        send_json(
-            writer,
-            &ClientMessage::Chat {
-                message: message.clone(),
-            },
-        )
-        .await;
-    }
-
-    app.input.clear();
-}
-
-fn draw_ui(frame: &mut ratatui::Frame, app: &App) {
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),    // chat
-            Constraint::Length(3), // input
-            Constraint::Length(2), // status/help
-        ])
-        .split(frame.area());
-
-    let chat_height = layout[0].height.saturating_sub(2) as usize;
-
-    let total_messages = app.messages.len();
-    let end = total_messages.saturating_sub(app.scroll.saturating_sub(chat_height));
-    let start = end.saturating_sub(chat_height);
-
-    let visible_messages = if start < end && end <= total_messages {
-        app.messages[start..end].join("\n")
-    } else {
-        String::new()
-    };
-
-    let messages = Paragraph::new(visible_messages)
-        .block(Block::default().borders(Borders::ALL).title("Chat"));
-
-    frame.render_widget(messages, layout[0]);
-
-    let input = Paragraph::new(app.input.as_str())
-        .block(Block::default().borders(Borders::ALL).title("Input"));
-
-    frame.render_widget(input, layout[1]);
-
-    let status = Paragraph::new(format!(
-        "User: {} | Room: {} | Commands: /join <room>  /leave  /rooms | Esc to quit",
-        app.username, app.room
-    ));
-
-    frame.render_widget(status, layout[2]);
-
-    let cursor_x = layout[1].x + 1 + app.input.len() as u16;
-    let cursor_y = layout[1].y + 1;
-    frame.set_cursor_position((cursor_x, cursor_y));
 }
 
 #[tokio::main]
@@ -257,7 +121,10 @@ async fn main() {
             return;
         }
         other => {
-            println!("Unexpected server response during authentication: {:?}", other);
+            println!(
+                "Unexpected server response during authentication: {:?}",
+                other
+            );
             return;
         }
     }
