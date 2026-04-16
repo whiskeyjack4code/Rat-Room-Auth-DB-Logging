@@ -168,6 +168,3 @@ SQLite database (`chat.db`) is created automatically.
 
 ---
 
-## License
-
-MIT
